@@ -1,0 +1,365 @@
+---
+title: "Achievement Emotions Analysis Pipeline"
+author: "Pavel Chernyavskiy"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,message=FALSE,warning=FALSE,error=TRUE)
+```
+
+# Preliminary Data Manipulation
+## Preamble
+
+FaceReader9 intensity ratings were output to Excel files, concatenated row-wise, extra columns were removed, and data were assigned a common timescale in seconds. Some of the participants' genders did not appear correctly, so we correct the gender variable using code below. The result was saved as an R object ("D_emo_01042023.rds"), where the current analysis begins.
+
+## Code preliminaries
+
+We load all necessary R packages and make a useful text processing function that we will use later: 
+```{r}
+#* load R packages *#
+library(dplyr)
+library(tidyverse)
+library(ggplot2)
+library(forcats)
+library(hms)
+library(lubridate)
+library(stringr)
+library(readxl)
+library(scales)
+
+#* make text processing function to use later *#
+substrRight <- function(x, n){substr(x, nchar(x)-n+1, nchar(x))}
+```
+
+## Read & filter emotion data
+
+Here, we set working directory (where R object is located), read in the saved R object, only retain emotions encoded between 40 and 250 seconds (3.5 mins of instruction), and correct the subjects' gender variable. The sub-section ends in a check of subjects' gender; the numbers reflect the count of 1/100th of a second of encoded emotion for each subject. The rows are subject IDs and columns are the two genders:
+```{r}
+#* set working directory, read in and process data *#
+setwd("C:/Users/pcher/Box/EMO Strategies/Cleaned FaceReader Data")
+D_emo<-readRDS("D_emo_01042023.rds") 
+D_emo<-D_emo %>% 
+       filter(Time_sec > 40) %>%  
+       filter(Time_sec < 250) 
+
+#* correct the gender variable *#
+D_emo[which(D_emo$ID == '046'),9]<-"Male" 
+D_emo[which(D_emo$ID == '049'),9]<-"Female" 
+D_emo[which(D_emo$ID == '054'),9]<-"Male" 
+D_emo[which(D_emo$ID == '066'),9]<-"Male" 
+D_emo[which(D_emo$ID == '072'),9]<-"Female" 
+D_emo[which(D_emo$ID == '077'),9]<-"Male" 
+D_emo[which(D_emo$ID == '080'),9]<-"Male" 
+D_emo[which(D_emo$ID == '191'),9]<-"Male" 
+D_emo[which(D_emo$ID == '194'),9]<-"Female" 
+D_emo[which(D_emo$ID == '204'),9]<-"Female" 
+D_emo[which(D_emo$ID == '212'),9]<-"Female" 
+D_emo[which(D_emo$ID == '213'),9]<-"Female" 
+D_emo[which(D_emo$ID == '261'),9]<-"Male" 
+D_emo[which(D_emo$ID == '283'),9]<-"Male" 
+
+#* correct gender and row counts of 15 subjects *#
+table(D_emo$ID,D_emo$Gender)
+```
+## Set a time sampling rate & convert to time-wide format
+
+Here, we set a sampling rate for time (1 second, 1/10th of a second, or 1/100th of a second), and convert from a "long" format to a "wide" format for functional regression analysis. Less frequent (slower) sampling rates will result in smoother data. Additionally, we filter out any FaceReader file (i.e. a subject's session), where at least 30% of the emotions could not be coded. 
+
+Because we currently analyze one emotion at a time, we select an emotion to analyze in the code below. Joy/happiness ("Happy") is currently selected. Other emotions ("Sad","Suprised") are commented out, but can be commented in to perform the analysis. The amount of coded emotion data that remains depends on the sampling rate: least data for 1 second, most data for 1/100th of a second. 
+
+Below we have 70 rows (70 sessions of 15 subjects with >70% coded emotions) and 214 time points (one column per second), across ~210 seconds of instruction.
+
+```{r}
+#* set a time sampling rate *#
+t_samp<-0 #0 for 1 second, 1 for 1/10 of sec, 2 for 1/100 of sec
+###
+D_emo1w<-D_emo %>% 
+  mutate(temp=substr(`Participant Name`,1,6)) %>%
+  #* remove sessions where >30% emotions are NAs **#
+  filter(!(temp %in%c('212_10','077_13','072_5_','080_8_', 
+                      '072_4_','212_13','046_7_','077_6_',
+                      '054_13','080_10','194_8_','049_13'))) %>%
+  #* apply time sampling rate here *#
+  mutate(Time_round = round(Time_sec,t_samp)) %>% 
+  #* select one emotion to analyze & other variables to carry forward*# 
+  select(
+    #   Surprised,#Sad, <-same code can be used for other emotions
+    Happy,            
+    Gender,ID,Session,Time_round,
+    -Time_sec) %>%
+  #* recast from long to wide time format *# 
+  pivot_wider(values_from = 1, 
+              names_from = 5,
+              values_fn = mean) #<-average w/in time sampling rate
+
+# retain 70 participants (rows) and 204 time points (columns)
+dim(D_emo1w)
+```
+
+# Emotional Intensity Interpolation
+## Exploring emotional intensity
+The goal of this sub-section is to interpolate and smooth the emotional intensity recorded during the retained sessions. Once interpolated, the intensities will serve as functional covariates in function-on-scalar regression. Here, we extract the intensities (without subject ID, gender) and visualize its distribution, for example for the first 4 sessions:
+```{r}
+# extract without ID and gender and recast as a matrix #
+Y<-D_emo1w %>% dplyr::select(-1:-3) %>% as.matrix()
+
+par(mfrow=c(2,2))
+hist(Y[,1])
+hist(Y[,2])
+hist(Y[,3])
+hist(Y[,4])
+```
+
+Importantly, intensity is defined as continuous between 0 and 1, so interpolation must account for this. We perform all interpolation on the logit scale, i.e. we transform the data from the (0,1) interval into the unbounded (-infinity, infinity) interval. This transformation is performed using the qlogis() function in the code or the link="logit" option.
+
+## Non-parametric regression to interpolate & smooth
+
+The method used to interpolate intensity, which in-turn will be used as a functional covariate, affects the functional regression output. In other words, how we choose to "fill in" the missing intensity and how smooth we make the emotions over time influences the noise in the explanatory variable and thus the realized statistical significance. Here, we use a form of non-parametric regression, called nonparametric kernel smoothing regression (Hayfield and Racine, 2008), such that fewer assumptions are required for interpolation. The smoothness of the predicted line, which affects the degree of smoothing and the accuracy of the interpolation (i.e., "bandwidth"), is selected using AIC. The smoothness is stationary, i.e. does not vary over time. 
+
+"Multistart 1 of 1" will appear in the output window to indicate when a single regression and interpolation has finished:
+```{r}
+#** Nonparametric regression to interpolate **#
+# read in np package
+# Tristen Hayfield and Jeffrey S. Racine (2008). Nonparametric Econometrics: 
+# The np Package. Journal of Statistical Software 27(5). DOI 10.18637/jss.v027.i05
+library(np)
+
+# unique times & time resolution #
+t<-unique(round(D_emo$Time_sec,t_samp))
+tres<-ncol(Y) #<-set resolution (original = num of Y columns)#
+
+# make time to predict #
+pred_t<-data.frame(t=seq(min(t),max(t),length=tres))
+# make a temporary repository
+temp<-sm_list<-list()
+
+# loop over the instructional sessions #
+for(i in 1:nrow(Y)){
+  temp[[i]]<- npregbw(ydat=qlogis(Y[i,]), xdat=t, nmulti=1,
+                      regtype="lc", 
+                      bwtype = "adaptive_nn", 
+                      bwmethod="cv.aic") %>%
+              npreg(exdat=pred_t)
+  sm_list[[i]]<- temp[[i]]$mean
+}
+```
+Now, we replace the original data with the smoothed data and visualize a few subjects. For every subject, we plot the functional data (ie emotional intensity of Joy, sampled every second over 30 to 230 sec) for all the sessions for that subject. Different colored lines delineate different instructional sessions. Different participants appear in different plots.
+
+Note that the intensity is plotted on the same scale it was interpolated (logit scale), not the orignial (0 to 1) intensity, but the shapes would be very similar.
+```{r}
+#* replace original data with smoothed emotion data *#
+Y_sm<-matrix(unlist(sm_list),
+             nrow=nrow(Y),byrow=TRUE) %>% as.matrix()
+D_sm<-cbind(D_emo1w[,1:3], Y_sm) #* <- ANALYSIS DATASET HERE *#
+
+#* visualize all sessions for some IDs *#
+matplot(x=seq(min(t),max(t),length=tres),
+        y=D_sm %>% 
+          filter(ID == "080") %>% 
+          select(-1:-3) %>% t(),
+        type='l',lwd=1.5,
+        xlab="Time(sec)",ylab='Intensity',main="ID 080",
+        lty=1:nrow(D_sm %>% filter(ID == "080") %>% 
+                   select(-1:-3) %>% t())
+)
+###
+matplot(x=seq(min(t),max(t),length=tres),
+        y=D_sm %>% 
+          filter(ID == "054") %>% 
+          select(-1:-3) %>% t(),
+        type='l',lwd=1.5,
+        xlab="Time(sec)",ylab='Intensity',main="ID 054",
+        lty=1:nrow(D_sm %>% filter(ID == "054") %>% 
+                   select(-1:-3) %>% t())
+) 
+###
+matplot(x=seq(min(t),max(t),length=tres),
+        y=D_sm %>% 
+          filter(ID == "230") %>% 
+          select(-1:-3) %>% t(),
+        type='l',lwd=1.5,
+        xlab="Time(sec)",ylab='Intensity',main="ID 230",
+        lty=1:nrow(D_sm %>% filter(ID == "230") %>% 
+                   select(-1:-3) %>% t())
+) 
+###
+matplot(x=seq(min(t),max(t),length=tres),
+        y=D_sm %>% 
+          filter(ID == "283") %>% 
+          select(-1:-3) %>% t(),
+        type='l',lwd=1.5,
+        xlab="Time(sec)",ylab='Intensity',main="ID 283",
+        lty=1:nrow(D_sm %>% filter(ID == "283") %>% 
+                   select(-1:-3) %>% t())
+) 
+```
+At this point, the emotion data are finalized. Each smoothed trajectory or line of emotion will be used as a functional covariate in a function-on-scalar regression.
+
+## Linkage to strategies database
+
+Here, we link the emotional intensity functional data to the strategies database. First, we aggregate the strategies database from ID-attempt level to ID-session level. In other words, each row of the data will be a particular ID during a particular session, along with their session accuracy (% of correct attempts), and perhaps session sophistication metrics, for ex: max sophistication, mean sophistication, modal sophistication, breadth.
+
+At time of writing, this database is under embargo and cannot be shared publicly.
+
+Code to pre-process the strategies database (applies some filters) and prepare for linkage as follows:
+```{r}
+setwd("C:/Users/pcher/Box/EMO Strategies/Cleaned FaceReader Data")
+math_dat<-read_xlsx("ArithStrat_allmergeddata_02_28_2022.xlsx",
+                    na="NA") %>%
+  #* apply filters to attempts *#
+  filter(!is.na(ArithStrat)) %>%       #  filter NAs
+  filter(!(PROB_TYPE %in% c(Prob_Type = "Composing Number","Equalize",
+                            "Compare","Counting", "Number Comparison"))) %>% 
+  filter(!(Correctness == 'NA')) %>%
+  
+  #* create an ID to match emotion data *#
+  mutate(ID = substrRight(CHILD_ID, 3)) %>%
+  
+  #* assign order to strategies and re-define as new variable Y *#
+  mutate(Y = ordered(ArithStrat,          
+                     levels=c("Wild Guess", "Reasonable Guess",
+                              "Trial & Error","Makes a set", "Counting All", 
+                              "Counting On - Concrete",   
+                              "Counting On - Abstract",
+                              "Jump Strategy","Combination",    
+                              "Derived Combination","Compensation",
+                              "Decomposition"))) %>% 
+  #* collapse some levels of Y together into new variable YC (Y Collapsed) #
+  mutate(YC = fct_collapse(Y,
+                           "Wild Guess" = "Wild Guess", 
+                           "RG & TE" = c("Reasonable Guess",
+                                         "Trial & Error"),
+                           "Makes a set" = "Makes a set",
+                           "Counting All" = "Counting All",
+                           "Counting On" = 
+                             c("Counting On - Concrete",
+                               "Counting On - Abstract"),
+                           "Jump Strategy" = "Jump Strategy",
+                           "Combination" = "Combination",
+                           "Derived Combination" = "Derived Combination",
+                           "Comp & Decomp" = c("Compensation","Decomposition")
+  )) %>% 
+  
+  #* make a numeric correctness variable (1 = correct OR correct w support) *#
+  mutate(Correct_num = if_else(
+         Correctness %in% c('Correct','Correct with Support'),1,0)) %>%          
+  #Correctness %in% c('Correct'),1,0)) %>% 
+  group_by(ID,GRA,SESSION) %>%   # GRA,
+  
+  #* make session-level metrics *#
+  summarise(avg_acc = mean(Correct_num),
+            acc_mod = mean(Correct_num)-1e-8, #<-avoid 100% correct
+            tot_att = n(),
+            tot_acc = sum(Correct_num),
+            max_soph = max(as.numeric(YC)),
+            breadth = length(unique(YC)))
+#* rename a column to match emotions *#
+colnames(math_dat)[3]<-"Session"
+
+#* examine resultant data *#
+head(math_dat)
+table(math_dat$ID,math_dat$Session)
+
+```
+
+Here, we perform the linkage to the emotion data and check the result:
+```{r}
+#* link (merge) together *#
+D_sm_linked<-merge(math_dat, #<-aggregated strategies data
+                   D_sm,     #<-smoothed emotion data
+                   by=c("ID","Session")) %>%
+             arrange(ID,GRA,Session)
+#* recast a few variables as factors *#
+D_sm_linked$ID<-as.factor(D_sm_linked$ID)
+D_sm_linked$GRA<-as.factor(D_sm_linked$GRA)
+D_sm_linked$Gender<-as.factor(D_sm_linked$Gender)
+
+#* take a peek at first 10 columns of the result *#
+glimpse(D_sm_linked[,1:10])
+#* emotional intensity starts at column 10
+glimpse(D_sm_linked[,1:20])
+```
+Note that 3 sessions out of the 70 could not be linked and so we have 67 sessions left for which linkage was successful. 
+
+Next, we retain only the emotion intensity columns and save them as a functional object (functional covariates) for functional regression analysis. Some re-arranging of the data is needed to make the final analysis dataset (D_fin):
+```{r}
+#* make emotional intensity functional covariate & analysis dataset *#
+Y_f<-D_sm_linked[,c(-1:-10)] %>% as.matrix() 
+D_fin<-data.frame(D_sm_linked[,1:10],I(Y_f)) %>% 
+       arrange(ID,Session)
+#* take a peek at first 10 columns of the analysis file *#
+glimpse(D_fin[,1:9])
+```
+# Functional Regression Analysis
+## Baseline model
+
+Here, we specify and estimate a baseline (non-functional) regression model and a function-on-scalar regression. Emotional intensity is a complex covariate, but the baseline model is nested within the functional model, so the two models can be tested via Likelihood Ratio Test and compared via AIC or BIC. We note that our final sample size is 67; it doesn't matter how many time points we use for encoded emotions since the entire curve is used as a single covariate using the lf() regression term. 
+
+The response variable is not functional (ie is a scalar) and it is the average accuracy  = proportion of correct attempts per session. Because the response is bounded between 0 and 1, a beta regression must be used. We note that we use the "modified" accuracy (average accuracy - 1e-8) to avoid 100% accuracy, which cannot be accommodated by the beta regression.
+
+Baseline (non-functional) model, which includes only the subject random intercept:
+```{r}
+library(refund)
+library(mgcv)
+library(lmtest)
+
+#* baseline accuracy *#
+fit0<-pfr(acc_mod ~ re(ID),
+          family=betar(),
+          method="REML",data=D_fin)
+summary(fit0)
+```
+A model with only the student random intercepts explains 55.8% of the variability in session accuracy. 
+
+Now we add the joy emotional intensity functional covariate through lf() and compare vs. the baseline model using a Likelihood Ratio Test (LRT): 
+```{r}
+#* emotion functional covariate *#
+fit1<-pfr(acc_mod ~ re(ID) + 
+            lf(Y_f,argvals = seq(min(t),max(t),length=ncol(Y_f))),
+          family=betar(),
+          method="REML",data=D_fin)
+summary(fit1)
+
+#* Likelihood Ratio Test
+lmtest::lrtest(fit0,fit1)
+
+#* AIC comparison
+AIC(fit0,fit1)
+```
+Joy emotional intensity over 40-250 seconds explains an additional 9.3% of the variability in accuracy. The LRT reveals the contribution of the functional emotional intensity covariate is statistically significant (p=0.0054); AIC of the model with emotional intensity is lower (-84.91 vs. -78.53), indicating the preferred model includes emotional intensity.
+
+We now examine the effect function, or the effect of joy on accuracy over 40-250 seconds. This figure is Figure 1 Panel A:
+```{r}
+#* plot the effect of joy on session accuracy
+plot(fit1,select=2)
+abline(h=0,col='blue',lty=2)
+```
+Here, it appears that more intense initial joy correlates with higher session accuracy, whereas more intense joy during the 2nd minute of the session correlates with lower session accuracy. 
+
+Now, we can add the session effect to account for passage of time in the intervention and dosage of instruction:
+```{r}
+#* baseline + Session effect *#
+fit2<-pfr(acc_mod ~ re(ID) + scale(Session),
+          family=betar(),
+          method="REML",data=D_fin)
+summary(fit2)
+
+#* emotion functional covariate + Session effect *#
+fit2em<-pfr(acc_mod ~ re(ID) + scale(Session) +
+            lf(Y_f,argvals = seq(min(t),max(t),length=ncol(Y_f))),
+          family=betar(),
+          method="REML",data=D_fin)
+summary(fit2em)
+
+#* Likelihood Ratio Test
+lmtest::lrtest(fit2,fit2em)
+
+#* AIC comparison
+AIC(fit2,fit2em)
+```
+If we include the session effect, the emotional intensity functional covariate is no longer technically statistically significant (LRT p-value=0.0592). AICs are nearly identical, which indicates that the inclusion of emotional intensity is not supported by the data, adjusted for session. 
